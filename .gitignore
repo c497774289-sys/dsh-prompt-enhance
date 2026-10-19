@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+dist/
+coverage/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# 本地配置与凭据（永不入库）
+.env
+.env.*
+*.key
+*.pem
+*.log

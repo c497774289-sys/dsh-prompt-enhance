@@ -1,0 +1,23 @@
+{
+  "name": "dsh-prompt-enhance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "提示词增强：输入框草稿一键扩写为结构化长提示词，可一键还原原文",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

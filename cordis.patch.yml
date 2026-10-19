@@ -1,0 +1,6 @@
+# dsh-prompt-enhance bundle patch.
+# One Host row over the web profile; the Client half registers the enhance
+# button into conversation.input.right.
+- insert:
+    - id: prompt-enhance
+      name: dsh-prompt-enhance
