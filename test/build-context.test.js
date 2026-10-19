@@ -218,3 +218,38 @@ test('readConversationContext：两条读取通道都抛错时静默返回空（
   };
   assert.deepEqual(await readConversationContext(spy, 'session-1'), { text: '', turns: 0 });
 });
+
+test('readConversationContext：裸 uuid 读不到时自动补 session- 前缀再试（插槽 inject 可能只给裸 uuid）', async () => {
+  const seen = [];
+  const spy = {
+    async readSurface(id) {
+      seen.push(id);
+      // 只认带前缀的 id；裸 uuid 抛「会话不存在」
+      if (!id.startsWith('session-')) throw new Error('SESSION_QUERY_SESSION_NOT_FOUND');
+      return {
+        events: [
+          { seq: 0, type: 'user/message', data: { content: [{ type: 'text', text: '前缀命中的问' }], source: { kind: 'user' } } },
+          { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '前缀命中的答' }] } } },
+        ],
+      };
+    },
+  };
+  const { text, turns } = await readConversationContext(spy, 'b3b423cc-1111-2222-3333-444455556666');
+  assert.equal(turns, 2);
+  assert.match(text, /前缀命中的问/);
+  assert.deepEqual(seen, ['b3b423cc-1111-2222-3333-444455556666', 'session-b3b423cc-1111-2222-3333-444455556666']);
+});
+
+test('readConversationContext：已经是 session- 前缀时不重复试，避免多读一次日志', async () => {
+  let calls = 0;
+  const spy = {
+    async readSurface() {
+      calls += 1;
+      throw new Error('SESSION_QUERY_SESSION_NOT_FOUND');
+    },
+    async filterEvents() { return []; },
+  };
+  const out = await readConversationContext(spy, 'session-abc');
+  assert.deepEqual(out, { text: '', turns: 0 });
+  assert.equal(calls, 1);
+});

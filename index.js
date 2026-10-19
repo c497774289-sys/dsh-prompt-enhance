@@ -228,42 +228,53 @@ export async function readConversationContext(sessionQuery, sessionId, options =
     }
   };
 
-  if (typeof sessionQuery.readSurface === 'function') {
-    try {
-      const surface = await sessionQuery.readSurface(sessionId);
-      const events = surface && Array.isArray(surface.events) ? surface.events : [];
-      const docs = [];
-      for (const event of events) {
-        const text = messageTextOf(event);
-        if (text) docs.push({ type: event.type, text });
+  /** 对单个 id 读一次：readSurface 优先，失败退 filterEvents。 */
+  const readOnce = async (id) => {
+    if (typeof sessionQuery.readSurface === 'function') {
+      try {
+        const surface = await sessionQuery.readSurface(id);
+        const events = surface && Array.isArray(surface.events) ? surface.events : [];
+        const docs = [];
+        for (const event of events) {
+          const text = messageTextOf(event);
+          if (text) docs.push({ type: event.type, text });
+        }
+        const built = finish(docs);
+        if (built.turns > 0) return built;
+      } catch {
+        // 落盘读取失败（会话还没持久化 / 日志损坏），继续走 filterEvents。
       }
-      return finish(docs);
-    } catch {
-      // 落盘读取失败（会话还没持久化 / 日志损坏），继续走 filterEvents。
     }
-  }
 
-  if (typeof sessionQuery.filterEvents !== 'function') return { text: '', turns: 0 };
-  const types = ['user/message', 'assistant/message'];
-  let docs = null;
-  try {
-    // surface=current 用来排掉被压缩/替换掉的旧版本，避免同一句话出现两遍。
-    docs = await sessionQuery.filterEvents(sessionId, [
-      { kind: 'type', values: types },
-      { kind: 'surface', values: ['current'] },
-    ]);
-  } catch {
-    return { text: '', turns: 0 };
-  }
-  if (!Array.isArray(docs) || docs.length === 0) {
-    // 有些历史日志没有 surface 元数据，会被判成 log-only —— 这时退回不带 surface 的查询。
+    if (typeof sessionQuery.filterEvents !== 'function') return { text: '', turns: 0 };
+    const types = ['user/message', 'assistant/message'];
+    let docs = null;
     try {
-      docs = await sessionQuery.filterEvents(sessionId, [{ kind: 'type', values: types }]);
+      // surface=current 用来排掉被压缩/替换掉的旧版本，避免同一句话出现两遍。
+      docs = await sessionQuery.filterEvents(id, [
+        { kind: 'type', values: types },
+        { kind: 'surface', values: ['current'] },
+      ]);
     } catch {
       return { text: '', turns: 0 };
     }
-  }
-  return finish(docs);
+    if (!Array.isArray(docs) || docs.length === 0) {
+      // 有些历史日志没有 surface 元数据，会被判成 log-only —— 这时退回不带 surface 的查询。
+      try {
+        docs = await sessionQuery.filterEvents(id, [{ kind: 'type', values: types }]);
+      } catch {
+        return { text: '', turns: 0 };
+      }
+    }
+    return finish(docs);
+  };
+
+  const primary = await readOnce(sessionId);
+  if (primary.turns > 0 || sessionId.startsWith('session-')) return primary;
+  // 会话 id 有两种写法：日志/服务端用 `session-<uuid>`，而插槽 inject 拿到的可能是裸 uuid。
+  // 读不到就补前缀再试一次 —— 否则会静默退化成「只看草稿」，用户只会觉得增强变钝了。
+  const prefixed = await readOnce(`session-${sessionId}`);
+  return prefixed.turns > 0 ? prefixed : primary;
 }
 
 /**
