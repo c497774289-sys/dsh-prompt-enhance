@@ -33,7 +33,8 @@ window.__ModuleLoader__.load({
      *
      * 为什么不放组件 state：按钮组件会因切会话 / InputBar 重挂载而重建，内存 state 一丢，
      * 用户就再也点不到「恢复原文」，原文永久丢失。放插件级 Map 里，只要页面不刷新就还在。
-     * @type {Map<string, {original:string, enhanced:string}>}
+     * contextTurns：本次增强实际用了最近多少条对话上下文（0 = 没用上）。
+     * @type {Map<string, {original:string, enhanced:string, contextTurns:number}>}
      */
     const ledger = new Map();
 
@@ -88,6 +89,8 @@ window.__ModuleLoader__.load({
           }
           const next = typeof payload.enhanced === 'string' ? payload.enhanced : '';
           if (!next) throw new Error('empty enhanced result');
+          // 服务端会带回这次实际用了几条会话上下文（0 = 没读到，退化成只看草稿）。
+          const contextTurns = Number.isFinite(payload.contextTurns) ? payload.contextTurns : 0;
           // 服务端降级时 source !== 'model'：结果仍是可用的结构化骨架，但不是模型写的。
           // 以前这里完全静默，用户只会觉得"效果一般"，查不出是模型挂了 —— 现在明确提示一句。
           if (payload.source !== 'model') {
@@ -96,7 +99,8 @@ window.__ModuleLoader__.load({
           } else {
             setDegraded(null);
           }
-          if (sessionId !== undefined) ledger.set(sessionId, { original: draft, enhanced: next });
+          console.info('[dsh-prompt-enhance] 增强完成，使用会话上下文', `${contextTurns} 条`);
+          if (sessionId !== undefined) ledger.set(sessionId, { original: draft, enhanced: next, contextTurns });
           inputActions.setDraft(next);
         } catch (error) {
           setFailed(true);
@@ -112,12 +116,14 @@ window.__ModuleLoader__.load({
         if (sessionId !== undefined) ledger.delete(sessionId);
       };
 
+      const contextNote =
+        rec && rec.contextTurns > 0 ? `（含最近 ${rec.contextTurns} 条上下文）` : '';
       const label = busy
         ? '增强中…'
         : enhanced
           ? degraded
             ? `恢复原文（本次为模板兜底：${degraded}）`
-            : '恢复原文'
+            : `恢复原文${contextNote}`
           : empty
             ? '先输入一些内容'
             : '增强为结构化提示词';

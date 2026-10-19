@@ -18,6 +18,17 @@ const FALLBACK_ROUTE = { provider: 'deepseek-account', model: 'deepseek-flash' }
 /** 宿主认这四个 reasoningEffort 值，其它值会让适配器抛 UNSUPPORTED_REASONING_EFFORT。 */
 const REASONING_EFFORTS = new Set(['off', 'low', 'high', 'max']);
 
+/**
+ * 上下文注入预算（用户 2026-10-19 拍板）。
+ * 长对话里「接着说」「按上面说的继续」这类草稿，光看自己一句是补不出来的，
+ * 必须把最近几轮对话一起给模型，否则增强结果会偏离上下文。
+ */
+export const CONTEXT_DEFAULTS = Object.freeze({
+  maxMessages: 6,
+  perMessageChars: 600,
+  totalChars: 3000,
+});
+
 /** 请求来源是否为 loopback。exact 路由绕过了 DSH 的围栏，这里必须自己判。 */
 export function isLoopbackAuthority(req) {
   const raw = String((req && req.headers && req.headers.host) || '');
@@ -120,6 +131,160 @@ export function templateFallback(draft) {
   ].join('\n');
 }
 
+/** 把一条事件文档映射成发言角色；非对话事件返回 null。 */
+function contextRoleOf(doc) {
+  const type = doc && doc.type;
+  if (type === 'user/message') return 'user';
+  if (type === 'assistant/message') return 'assistant';
+  const role = doc && doc.role;
+  return role === 'user' || role === 'assistant' ? role : null;
+}
+
+/**
+ * 把事件文本拼成给模型看的「前文对话」块。
+ *
+ * 从**最后一条往前**取，保证预算紧张时保住最贴近当前草稿的那几轮；
+ * 每条单独截断（避免一条长回复吃满预算），总量再卡一道。
+ *
+ * @param {Array<{type?:string, role?:string, text?:string}>} docs
+ * @param {{maxMessages?:number, perMessageChars?:number, totalChars?:number, excludeText?:string}} [options]
+ * @returns {{text:string, turns:number}}
+ */
+export function buildConversationContext(docs, options = {}) {
+  const maxMessages = Number.isFinite(options.maxMessages) ? options.maxMessages : CONTEXT_DEFAULTS.maxMessages;
+  const perMessageChars = Number.isFinite(options.perMessageChars) ? options.perMessageChars : CONTEXT_DEFAULTS.perMessageChars;
+  const totalChars = Number.isFinite(options.totalChars) ? options.totalChars : CONTEXT_DEFAULTS.totalChars;
+  const excludeText = typeof options.excludeText === 'string' ? options.excludeText.trim() : '';
+  if (!Array.isArray(docs) || maxMessages <= 0) return { text: '', turns: 0 };
+
+  const lines = [];
+  let used = 0;
+  let turns = 0;
+  for (let index = docs.length - 1; index >= 0 && turns < maxMessages; index -= 1) {
+    const doc = docs[index];
+    const role = contextRoleOf(doc);
+    if (!role) continue;
+    const raw = String((doc && doc.text) || '').trim();
+    if (!raw) continue;
+    // 草稿本身还没发出去，但如果用户是对着已发送的同一句话再点一次，别把它重复喂一遍。
+    if (excludeText && role === 'user' && raw === excludeText) continue;
+    let body = raw.replace(/\n{3,}/gu, '\n\n');
+    if (body.length > perMessageChars) body = `${body.slice(0, perMessageChars)}…`;
+    const line = `${role === 'user' ? '用户' : '助手'}：${body}`;
+    if (used + line.length > totalChars) break;
+    lines.unshift(line);
+    used += line.length + 1;
+    turns += 1;
+  }
+  return { text: lines.join('\n\n'), turns };
+}
+
+/** 只取消息里的 text block —— tool-call / 图片 / 推理块一律不要（它们会把上下文变成代码噪声）。 */
+function messageTextOf(event) {
+  const type = event && event.type;
+  let content;
+  if (type === 'user/message') {
+    // user/message 里混着大量「系统注入的假用户消息」：workspace 规约(agent-instructions)、
+    // 运行时快照(runtime-context)、整份 skill catalog(skill-catalog，实测单条 35557 字符)、
+    // 时间戳(time-context)。它们带 data.source.kind，真人输入是 kind === 'user'。
+    // 不过滤的话，上下文里会塞进几万字噪声，把真正的对话挤出预算。
+    const source = event.data && event.data.source;
+    if (source && source.kind && source.kind !== 'user') return '';
+    content = event.data && event.data.content;
+  } else if (type === 'assistant/message') content = event.data && event.data.message && event.data.message.content;
+  else return '';
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const block of content) {
+    if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+  }
+  return parts.join('\n').trim();
+}
+
+/**
+ * 从宿主 sessionQuery 读当前会话最近的消息，构建上下文。
+ *
+ * 优先 `readSurface`（返回当前模型面的事件本体，已经做过压缩/替换折叠，
+ * 不会把同一句话读两遍），文本抽取自己按 text block 做 —— 因为宿主
+ * `filterEvents` 的 `extractSessionEventText` 会**把 tool-call 的参数也拼进去**
+ * （实测 assistant 消息里会混进整段 edit 的 file_path/diff），那些东西进上下文只有坏处。
+ *
+ * `readSurface` 不可用时退回 `filterEvents`（只按类型筛），最后一道是静默空上下文 ——
+ * 上下文是加分项，绝不能因为它让增强整体失败。
+ *
+ * @param {{readSurface?:Function, filterEvents?:Function}|null|undefined} sessionQuery
+ * @param {string} sessionId
+ * @param {object} [options] 透传 buildConversationContext 的预算
+ * @returns {Promise<{text:string, turns:number}>}
+ */
+export async function readConversationContext(sessionQuery, sessionId, options = {}) {
+  if (!sessionQuery || typeof sessionId !== 'string' || !sessionId) return { text: '', turns: 0 };
+  const finish = (docs) => {
+    try {
+      return buildConversationContext(docs, options);
+    } catch {
+      return { text: '', turns: 0 };
+    }
+  };
+
+  if (typeof sessionQuery.readSurface === 'function') {
+    try {
+      const surface = await sessionQuery.readSurface(sessionId);
+      const events = surface && Array.isArray(surface.events) ? surface.events : [];
+      const docs = [];
+      for (const event of events) {
+        const text = messageTextOf(event);
+        if (text) docs.push({ type: event.type, text });
+      }
+      return finish(docs);
+    } catch {
+      // 落盘读取失败（会话还没持久化 / 日志损坏），继续走 filterEvents。
+    }
+  }
+
+  if (typeof sessionQuery.filterEvents !== 'function') return { text: '', turns: 0 };
+  const types = ['user/message', 'assistant/message'];
+  let docs = null;
+  try {
+    // surface=current 用来排掉被压缩/替换掉的旧版本，避免同一句话出现两遍。
+    docs = await sessionQuery.filterEvents(sessionId, [
+      { kind: 'type', values: types },
+      { kind: 'surface', values: ['current'] },
+    ]);
+  } catch {
+    return { text: '', turns: 0 };
+  }
+  if (!Array.isArray(docs) || docs.length === 0) {
+    // 有些历史日志没有 surface 元数据，会被判成 log-only —— 这时退回不带 surface 的查询。
+    try {
+      docs = await sessionQuery.filterEvents(sessionId, [{ kind: 'type', values: types }]);
+    } catch {
+      return { text: '', turns: 0 };
+    }
+  }
+  return finish(docs);
+}
+
+/**
+ * 拼给模型的 user 消息正文：有上下文就先放「前文对话」，再放「当前草稿」。
+ * 明确告诉模型「不要复述上下文」，否则它容易把前文抄进增强结果里。
+ */
+function composeUserPrompt(draft, context) {
+  const body = String(draft || '');
+  const contextText = context && typeof context.text === 'string' ? context.text.trim() : '';
+  if (!contextText) return body;
+  return [
+    '## 前文对话（供理解上下文，不要复述，也不要照抄）',
+    '',
+    contextText,
+    '',
+    '## 当前草稿（待增强）',
+    '',
+    body,
+  ].join('\n');
+}
+
 /**
  * 调 Harness 的 llm 服务做语义增强。
  *
@@ -131,10 +296,10 @@ export function templateFallback(draft) {
  *
  * @param {object} llm - Harness llm 服务
  * @param {string} draft - 用户原始草稿
- * @param {{signal?:AbortSignal, route?:{provider:string, model:string}}} options
+ * @param {{signal?:AbortSignal, route?:{provider:string, model:string}, context?:{text:string, turns:number}}} options
  * @returns {Promise<{text:string, usage:object|null}>}
  */
-async function callModel(llm, draft, { signal, route } = {}) {
+async function callModel(llm, draft, { signal, route, context } = {}) {
   // ★ content 必须是 block 数组 ★（2026-10-19 修，本次故障根因）
   // 之前传裸字符串 `content: '...'`，而 DeepSeek 适配器转 wire 时执行
   // `message.content.some(...)` / `message.content.flatMap(...)`，
@@ -143,7 +308,7 @@ async function callModel(llm, draft, { signal, route } = {}) {
   // 于是每次点击都静默降级成规则模板。宿主只认 `[{type:'text',text}]`。
   const messages = [
     { role: 'system', content: [{ type: 'text', text: SYSTEM_PROMPT }] },
-    { role: 'user', content: [{ type: 'text', text: String(draft || '') }] },
+    { role: 'user', content: [{ type: 'text', text: composeUserPrompt(draft, context) }] },
   ];
   const target = route && route.provider && route.model
     ? route
@@ -185,9 +350,10 @@ async function callModel(llm, draft, { signal, route } = {}) {
  * @param {object} deps
  * @param {object} deps.llm - Harness llm 服务（llm.stream）
  * @param {{provider:string, model:string}} [deps.route] - 走哪个 provider/model
+ * @param {object} [deps.sessionQuery] - 可选：读会话历史的宿主服务
  * @param {(msg:string)=>void} [deps.logger]
  */
-export async function handleEnhance(req, res, { llm, route, logger = console } = {}) {
+export async function handleEnhance(req, res, { llm, route, logger = console, sessionQuery, contextOptions } = {}) {
   if (req.method !== 'POST') {
     sendJson(res, 405, { ok: false, error: 'method not allowed' });
     return;
@@ -211,21 +377,45 @@ export async function handleEnhance(req, res, { llm, route, logger = console } =
     return;
   }
 
+  // 上下文是加分项：读不到 / 服务没装 / 会话还没落盘，一律当「没有上下文」继续。
+  let context = { text: '', turns: 0 };
+  if (typeof payload.sessionId === 'string' && payload.sessionId) {
+    try {
+      context = await readConversationContext(sessionQuery, payload.sessionId, {
+        ...contextOptions,
+        excludeText: draft.trim(),
+      });
+    } catch {
+      context = { text: '', turns: 0 };
+    }
+  }
+
   const controller = new AbortController();
   // 客户端断开时取消模型调用，避免悬挂流。
   res.on('close', () => { if (!res.writableEnded) controller.abort(); });
 
   try {
-    const { text, usage } = await callModel(llm, draft, { signal: controller.signal, route });
+    const { text, usage } = await callModel(llm, draft, { signal: controller.signal, route, context });
     if (!text) {
-      sendJson(res, 200, { ok: true, enhanced: templateFallback(draft), source: 'fallback-empty' });
+      sendJson(res, 200, {
+        ok: true,
+        enhanced: templateFallback(draft),
+        source: 'fallback-empty',
+        contextTurns: context.turns,
+      });
       return;
     }
-    sendJson(res, 200, { ok: true, enhanced: text, source: 'model', usage });
+    sendJson(res, 200, { ok: true, enhanced: text, source: 'model', usage, contextTurns: context.turns });
   } catch (error) {
     if (controller.signal.aborted) return; // 客户端已断开，不再回写
     logger.warn?.(`prompt-enhance: 模型调用失败，降级模板 — ${String((error && error.message) || error)}`);
-    sendJson(res, 200, { ok: true, enhanced: templateFallback(draft), source: 'fallback', reason: String((error && error.message) || error) });
+    sendJson(res, 200, {
+      ok: true,
+      enhanced: templateFallback(draft),
+      source: 'fallback',
+      reason: String((error && error.message) || error),
+      contextTurns: context.turns,
+    });
   }
 }
 
@@ -259,10 +449,30 @@ export function apply(ctx, config) {
     } catch { /* 服务没装或还没就绪，走兜底 */ }
     return routeSnapshot;
   };
+
+  /**
+   * sessionQuery 也是可选依赖（没有它 = 不带上下文增强，功能照常）。
+   * 绝对不能塞进 `ctx.inject(['llm','webServer'])` 的必需数组 ——
+   * cordis 对缺失依赖的处理是「inject 回调永不执行」，那样连路由都不会挂载。
+   */
+  let querySnapshot = null;
+  const readQuery = () => {
+    try {
+      const viaReflect = ctx.reflect?.get('sessionQuery', false);
+      if (viaReflect) return viaReflect;
+    } catch { /* 服务不存在 */ }
+    return querySnapshot;
+  };
+
   const routeBase = '/prompt-enhance';
 
   const handler = (req, res) =>
-    handleEnhance(req, res, { llm: readLlm(), route: readRoute(), logger });
+    handleEnhance(req, res, {
+      llm: readLlm(),
+      route: readRoute(),
+      sessionQuery: readQuery(),
+      logger,
+    });
 
   ctx.inject(['llm', 'webServer'], (scoped) => {
     llmSnapshot = scoped.llm ?? null;
@@ -286,12 +496,21 @@ export function apply(ctx, config) {
     })();
     const disposers = [
       disposeRoute,
+      (() => {
+        try {
+          return ctx.inject(['sessionQuery'], (withQuery) => {
+            querySnapshot = withQuery.sessionQuery ?? null;
+            return () => { querySnapshot = null; };
+          });
+        } catch { return () => {}; }
+      })(),
       scoped.webServer.register({ kind: 'exact', path: `${routeBase}/enhance`, handler }),
     ];
     logger.info?.('prompt-enhance: 路由已挂载 POST /prompt-enhance/enhance');
     return () => {
       llmSnapshot = null;
       routeSnapshot = null;
+      querySnapshot = null;
       for (const dispose of disposers) {
         try { dispose?.(); } catch { /* 注销失败不影响卸载 */ }
       }

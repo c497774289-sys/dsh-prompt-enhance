@@ -42,8 +42,9 @@ test('apply 注入 llm + webServer，注册 POST /prompt-enhance/enhance 的 exa
   const { ctx, seen } = fakeCtx();
   apply(ctx, {});
 
-  // 第一次注入是必需依赖，第二次是可选依赖（agentDefaultModel，缺了就走兜底路由）。
-  assert.deepEqual(seen.injected, [['llm', 'webServer'], ['agentDefaultModel']]);
+  // 第一次注入是必需依赖；后两次是可选依赖（agentDefaultModel 缺了走兜底路由，
+  // sessionQuery 缺了只是不带上下文增强），所以都不能并进第一个数组。
+  assert.deepEqual(seen.injected, [['llm', 'webServer'], ['agentDefaultModel'], ['sessionQuery']]);
   assert.equal(seen.registered.length, 1);
 
   const spec = seen.registered[0];

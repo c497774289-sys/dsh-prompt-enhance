@@ -14,9 +14,12 @@
 
 ## 架构（B + A 兜底）
 
-- **B 模型语义增强**：宿主半边调 Harness 自己的 `llm` 服务，
-  `provider: 'our-free-model'`、`model: 'mimo-v2.6-flash-free'`
-  （OFM 已注册 adapter，插件直接复用免密通道，不碰它的 HTTP 转发端口）。
+- **B 模型语义增强**：宿主半边调 Harness 自己的 `llm` 服务，**模型不写死**——
+  读 `agentDefaultModel` 的 `currentSelection()` 跟随用户当前选的模型
+  （profile 里配的是 `deepseek-account` / `deepseek-flash`），读不到才退
+  `deepseek-account` / `deepseek-flash` 兜底。**不要写死 OFM 的免费模型**：
+  `mimo-v2.6-flash-free` 属 OpenCode 免费通道，DSH 里调用必报
+  `OpenCode's free tier can only be used from within OpenCode`。
 - **A 规则模板兜底**：模型不可达 / 返回空 / 报 error kind → 套一份带
   `# 任务 / ## 角色 / ## 背景 / ## 要求 / ## 输出格式` 的骨架模板，
   占位处提示用户自己补，并 `source: 'fallback'` 告知降级来源。
@@ -50,11 +53,14 @@
 2. **keyboard（SessionInputShell）是 composer.bar inject 的私有 prop**，
    `conv-client.js:14290-14299` 注释明说 "package-internal — handed through the
    composer-bar entry's inject, never across a plugin boundary"。
-3. **插件侧唯一正路**：`ctx.inject(['conversation'], ...)` 拿 ConversationController，
-   `conversation.input.shell(sessionId)` 拿 shell。范式抄 `queueDockEntry`
-   （`conv-client.js:15668-15697`）。shell 上的 API：`snapshot`（getter，读
-   `{draft, attachmentIds, phase, draftRev}`）、`setDraft(text)`、`notify(level, text)`、
-   `state`（createSnapshotStore，subscribe/getSnapshot）。
+3. ~~插件侧正路：`ctx.inject(['conversation'], ...)`~~ —— **这条是错的，别照抄**。
+   `conversation` 服务由 `dsh-client-ui-conversation` 在**它自己的 fiber** 上
+   `provide`，第三方插件是兄弟节点，永远拿不到；cordis 对缺失依赖只是不执行回调、
+   **零报错**，症状就是按钮静默不出现。
+   **真正可用的通道是插槽下发的标准 kit**：`conv-client.js:19710-19726` 的
+   `ctx.uiSession.provide({ hooks:['conversation','input'], props:['inputActions'], ... })`
+   让每个条目白拿到 `useInput(selector)`（源 `shell.state`）与 `inputActions`
+   （= `shell.actions`，含 `setDraft`）。所以注册只要 `inject: ['slots']`。
 4. **shell 上没有 `sessionId` 成员**。deps 里没传，sessionId 只在
    `session.getSnapshot().sessionId`。插件要用就从 register 的 `inject:(sessionId)`
    参数闭包捕获，别去 shell 上找。
@@ -92,11 +98,33 @@ fiber 上下文，而 `llm` 只声明在 `ctx.inject(['llm','webServer'], scoped
 > 在外层 `ctx` 上直接点。cordis 的 `disabled`/`inject` 都是"跳过 apply"级别，
 > 但属性读取这一层是硬抛。
 
+## 会话上下文（2026-10-19 新增）
+
+长对话里「接着说」「按上面的继续」这类草稿，只看自己一句是补不出来的。现在增强前会
+从宿主 `sessionQuery` 读**最近 6 条** user/assistant 消息（每条 ≤600 字符、总计 ≤3000）
+一起喂给模型，prompt 分两节：`## 前文对话（供理解上下文，不要复述，也不要照抄）` +
+`## 当前草稿（待增强）`。
+
+- 读取优先 `readSurface`（拿当前模型面事件本体，压缩/替换已折叠），失败退 `filterEvents`，
+  再失败静默空上下文——**上下文是加分项，绝不能拖垮增强**。
+- 文本抽取自己按 text block 做：宿主 `extractSessionEventText` 会把 `tool/call` 的
+  `name + arguments` 也拼进去（实测 assistant 消息里混进整段 edit 的 file_path/diff）。
+- **必须按 `data.source.kind` 过滤假用户消息**：`user/message` 里混着
+  `agent-instructions` / `runtime-context` / `skill-catalog` / `time-context` 等系统注入
+  （实测 skill catalog 单条 **35557 字符**），真人输入是 `kind === 'user'`。不过滤的话
+  几万字噪声会把真正的对话挤出预算（实测同一会话：过滤前 6 条 / 2233 字符且全是噪声，
+  过滤后 4 条 / 1361 字符）。`plugin:meow-memory` 这类记忆注入同样要丢。
+- 响应里回传 `contextTurns`，按钮 tooltip 显示「含最近 N 条上下文」，前端 `console.info` 一行。
+
 ## 测试
 
 ```
-pnpm test     # node --test test/*.test.js，22 项
+pnpm test     # node --test test/*.test.js，51 项
 ```
 
 覆盖：回环守卫（含 IPv6 与域名混淆）、模板兜底骨架、路由 405/403/400/降级全分支、
-provider 与 model 钉死、apply 接线（含 cordis 服务访问回归）。
+模型路由跟随 agentDefaultModel、上下文预算/截断/取最近/注入过滤/双通道降级、
+客户端注册与三态交互、apply 接线（含 cordis 服务访问回归）。
+
+> 跑测试必须 `node --test test/*.test.js`：Node 24 传目录（`node --test test/`）会
+> 报 `pass 0 / fail 1`，是参数用法问题，不是用例坏了。

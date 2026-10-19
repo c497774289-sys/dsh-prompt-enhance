@@ -220,3 +220,82 @@ test('route 里的 reasoningEffort 会透传；非法值不传（否则适配器
   });
   assert.equal(llm2.calls[0].reasoningEffort, undefined);
 });
+
+// ── 会话上下文（2026-10-19）───────────────────────────────────────────────
+
+/** 假 sessionQuery：filterEvents 返回给定文档，并记录调用。 */
+function makeSessionQuery({ docs = [], throws = null } = {}) {
+  return {
+    calls: [],
+    async filterEvents(sessionId, filters) {
+      this.calls.push({ sessionId, filters });
+      if (throws) throw throws;
+      return docs;
+    },
+  };
+}
+
+test('带 sessionId 且有 sessionQuery：最近对话被拼进 user 消息，contextTurns 回传', async () => {
+  const llm = makeLlm({ chunks: [
+    { type: 'text-delta', text: '增强结果' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ] });
+  const sessionQuery = makeSessionQuery({
+    docs: [
+      { seq: 0, type: 'user/message', text: '我在做一个硬件驾驶舱' },
+      { seq: 1, type: 'assistant/message', text: '可以从三个维度拆' },
+    ],
+  });
+  const res = makeRes();
+  await handleEnhance(makeReq({ body: '{"text":"继续说说","sessionId":"s-1"}' }), res, { llm, sessionQuery });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.payload.source, 'model');
+  assert.equal(res.payload.contextTurns, 2);
+
+  const userContent = llm.calls[0].messages[1].content;
+  assert.ok(Array.isArray(userContent), 'content 仍是 block 数组');
+  const prompt = userContent[0].text;
+  assert.match(prompt, /## 前文对话/);
+  assert.match(prompt, /我在做一个硬件驾驶舱/);
+  assert.match(prompt, /可以从三个维度拆/);
+  assert.match(prompt, /## 当前草稿（待增强）/);
+  assert.match(prompt, /继续说说/);
+  // 上下文必须排在草稿之前，模型才把它当"前文"而不是"待办"
+  assert.ok(prompt.indexOf('前文对话') < prompt.indexOf('继续说说'));
+});
+
+test('没有 sessionId：不碰 sessionQuery，也不带上下文块', async () => {
+  const llm = makeLlm({ chunks: [{ type: 'text-delta', text: 'ok' }, { type: 'finish', reason: { kind: 'stop' } }] });
+  const sessionQuery = makeSessionQuery({ docs: [{ seq: 0, type: 'user/message', text: '不该出现' }] });
+  const res = makeRes();
+  await handleEnhance(makeReq({ body: '{"text":"写个登录"}' }), res, { llm, sessionQuery });
+
+  assert.equal(sessionQuery.calls.length, 0);
+  assert.equal(res.payload.contextTurns, 0);
+  assert.equal(llm.calls[0].messages[1].content[0].text, '写个登录');
+  assert.ok(!llm.calls[0].messages[1].content[0].text.includes('不该出现'));
+});
+
+test('sessionQuery 抛错：增强照常成功，上下文算 0 条（绝不能拖垮主流程）', async () => {
+  const llm = makeLlm({ chunks: [{ type: 'text-delta', text: '增强结果' }, { type: 'finish', reason: { kind: 'stop' } }] });
+  const sessionQuery = makeSessionQuery({ throws: new Error('SESSION_QUERY_PERSISTENCE_FAILED') });
+  const res = makeRes();
+  await handleEnhance(makeReq({ body: '{"text":"写个登录","sessionId":"s-1"}' }), res, { llm, sessionQuery });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.payload.source, 'model');
+  assert.equal(res.payload.contextTurns, 0);
+  assert.equal(llm.calls[0].messages[1].content[0].text, '写个登录');
+});
+
+test('模型降级时也回传 contextTurns，便于前端排查"为什么没吃到上下文"', async () => {
+  const llm = makeLlm({ throws: new Error('gateway down') });
+  const sessionQuery = makeSessionQuery({
+    docs: [{ seq: 0, type: 'user/message', text: '前文' }],
+  });
+  const res = makeRes();
+  await handleEnhance(makeReq({ body: '{"text":"写个登录","sessionId":"s-1"}' }), res, { llm, sessionQuery });
+  assert.equal(res.payload.source, 'fallback');
+  assert.equal(res.payload.contextTurns, 1);
+});
